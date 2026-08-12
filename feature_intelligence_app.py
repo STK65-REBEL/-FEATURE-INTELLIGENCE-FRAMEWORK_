@@ -430,11 +430,25 @@ h2, h3 { font-weight: 700 !important; color: #0B2559 !important; }
 [data-testid="stSidebar"] {
   background: #0B2559;
 }
-[data-testid="stSidebar"] * { color: #E7ECF5 !important; }
+/* Text that sits directly on the dark background: headings, labels, captions, plain markdown */
 [data-testid="stSidebar"] h1, [data-testid="stSidebar"] h2, [data-testid="stSidebar"] h3 { color: #FFFFFF !important; font-weight: 800 !important; }
-[data-testid="stSidebar"] .stSelectbox label, [data-testid="stSidebar"] .stTextInput label, [data-testid="stSidebar"] .stRadio label { color: #AFC2E6 !important; font-weight: 600 !important; font-size: 0.8rem !important; text-transform: uppercase; letter-spacing: 0.03em; }
-[data-testid="stSidebar"] [data-testid="stMetricValue"] { color: #FFFFFF !important; }
-[data-testid="stSidebar"] [data-testid="stMetricLabel"] { color: #AFC2E6 !important; }
+[data-testid="stSidebar"] [data-testid="stCaptionContainer"], [data-testid="stSidebar"] [data-testid="stCaptionContainer"] * { color: #AFC2E6 !important; }
+[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p { color: #E7ECF5; }
+[data-testid="stSidebar"] [data-testid="stWidgetLabel"] p {
+  color: #AFC2E6 !important; font-weight: 600 !important; font-size: 0.78rem !important;
+  text-transform: uppercase; letter-spacing: 0.03em;
+}
+[data-testid="stSidebar"] [data-testid="stRadio"] label p { color: #E7ECF5 !important; }
+
+/* Widgets with their own white/light background need DARK text — do not force light color here */
+[data-testid="stSidebar"] [data-baseweb="select"] * { color: #1F2A37 !important; }
+[data-testid="stSidebar"] input { color: #1F2A37 !important; }
+[data-testid="stSidebar"] [data-testid="stMetric"] {
+  background: #FFFFFF; border-radius: 8px; padding: 10px 14px; border: 1px solid rgba(255,255,255,0.12);
+}
+[data-testid="stSidebar"] [data-testid="stMetricValue"] { color: #0B2559 !important; }
+[data-testid="stSidebar"] [data-testid="stMetricLabel"] { color: #667085 !important; }
+
 [data-testid="stSidebar"] hr { border-color: rgba(255,255,255,0.15); }
 [data-testid="stSidebar"] .stButton button { background: #1D4ED8; color: #FFFFFF; border: none; font-weight: 700; }
 [data-testid="stSidebar"] .stButton button:hover { background: #2563EB; }
@@ -554,13 +568,16 @@ with st.sidebar:
         index=_scope_options.index(st.session_state.market_scope),
         help="Restricts every comparison view (charts, tables, rankings) to vehicles in this segment. Data Input still shows every vehicle regardless of scope.")
 
-    _scoped_count = len(st.session_state.vehicles) if st.session_state.market_scope == "Overall Market" else sum(
-        1 for v in st.session_state.vehicles if (st.session_state.class_.get(v) or "Unclassified") == st.session_state.market_scope)
-    st.metric("Vehicles in Scope", f"{_scoped_count} / {len(st.session_state.vehicles)}")
+    _scoped_vehicles = st.session_state.vehicles if st.session_state.market_scope == "Overall Market" else [
+        v for v in st.session_state.vehicles if (st.session_state.class_.get(v) or "Unclassified") == st.session_state.market_scope]
+    st.metric("Vehicles in Scope", f"{len(_scoped_vehicles)} / {len(st.session_state.vehicles)}")
 
+    if st.session_state.base_vehicle not in _scoped_vehicles and _scoped_vehicles:
+        st.session_state.base_vehicle = _scoped_vehicles[0]
     st.session_state.base_vehicle = st.selectbox(
-        "Base vehicle", st.session_state.vehicles,
-        index=st.session_state.vehicles.index(st.session_state.base_vehicle) if st.session_state.base_vehicle in st.session_state.vehicles else 0,
+        "Base vehicle", _scoped_vehicles,
+        index=_scoped_vehicles.index(st.session_state.base_vehicle) if st.session_state.base_vehicle in _scoped_vehicles else 0,
+        help="Only shows vehicles within the Market Scope above. Switch scope to \"Overall Market\" to pick any vehicle as base.",
     )
     st.session_state.score_mode = st.radio("Score mode", ["Engineering", "Customer-Weighted"], horizontal=True)
     st.session_state.numeric_mode = st.radio("Numeric normalization", ["Relative", "Fixed Ceiling"], horizontal=True)
@@ -778,6 +795,20 @@ with tabs[2]:
             pool = [v for v in vehicles if seg_filter == "All" or class_of(v) == seg_filter]
             has_it = [v for v in pool if contribution_for(frow, v, cat_by_name, {}, "relative") > 0]
             st.metric("Penetration", f"{round(len(has_it)/len(pool)*100) if pool else 0}%")
+
+            if frow["type"] != "Categorical" and pool:
+                mult = cat_by_name.get(frow["category"], {"multiplier": 1})["multiplier"]
+                scatter_rows = [{
+                    "Vehicle": v, "Price": price_of(v), "Class": class_of(v),
+                    "Feature Level": round(contribution_for(frow, v, cat_by_name, {}, "relative") / mult, 2) if mult else 0,
+                    "Value": display_value(frow, v),
+                } for v in pool]
+                fig_pen = px.scatter(pd.DataFrame(scatter_rows), x="Price", y="Feature Level", color="Class",
+                                      text="Vehicle", hover_data=["Value"], color_discrete_sequence=CLASS_COLORS)
+                fig_pen.update_traces(textposition="top center", marker=dict(size=11))
+                fig_pen.update_layout(height=340, yaxis=dict(range=[-0.1, 1.1]),
+                                       yaxis_title="Feature Level (0 = absent, 1 = best available)")
+                st.plotly_chart(fig_pen, use_container_width=True)
             st.dataframe(pd.DataFrame([{"Vehicle": v, "Value": display_value(frow, v)} for v in pool]),
                          use_container_width=True, hide_index=True)
 
@@ -813,13 +844,16 @@ with tabs[3]:
 # ---------------- CATEGORY / SUBGROUP ----------------
 with tabs[4]:
     st.subheader("Category Score by Vehicle")
-    cat_chart = pd.DataFrame([{"Category": c, "Vehicle": v, "Score": cat_score_of(v, c)} for c in cat_names for v in active_vehicles])
-    fig = px.bar(cat_chart, x="Category", y="Score", color="Vehicle", barmode="group")
-    fig.update_layout(height=380)
+    cat_chart = pd.DataFrame([{"Category": c, "Vehicle": v, "Score": round(cat_score_of(v, c), 2)} for c in cat_names for v in active_vehicles])
+    fig = px.bar(cat_chart, x="Category", y="Score", color="Vehicle", barmode="group", text="Score")
+    fig.update_traces(textposition="outside", textfont_size=9)
+    fig.update_layout(height=420, legend=dict(orientation="h", yanchor="bottom", y=1.02))
     st.plotly_chart(fig, use_container_width=True)
 
     st.subheader("Subgroup Analysis")
-    sub_cat = st.selectbox("Category", cat_names, key="subgroup_cat")
+    sc1, sc2 = st.columns([3, 1])
+    sub_cat = sc1.selectbox("Category", cat_names, key="subgroup_cat")
+    sub_orientation = sc2.radio("Orientation", ["Horizontal", "Vertical"], key="subgroup_orientation")
     subgroups = []
     seen = set()
     for r in rows:
@@ -829,11 +863,21 @@ with tabs[4]:
     for sg in subgroups:
         for v in active_vehicles:
             val = sum(contribution_for(r, v, cat_by_name, {}, "relative") for r in rows if r["category"] == sub_cat and r["subgroup"] == sg)
-            sub_records.append({"Subgroup": sg, "Vehicle": v, "Score": val})
+            sub_records.append({"Subgroup": sg, "Vehicle": v, "Score": round(val, 2)})
     if sub_records:
-        fig2 = px.bar(pd.DataFrame(sub_records), x="Score", y="Subgroup", color="Vehicle", orientation="h", barmode="group")
-        fig2.update_layout(height=max(320, len(subgroups) * max(28 * len(active_vehicles), 90)), legend=dict(orientation="h", yanchor="bottom", y=1.02))
+        sub_df = pd.DataFrame(sub_records)
+        bar_px = min(22, max(10, 260 // max(1, len(active_vehicles))))  # thinner bars as vehicle count grows, never disappearing
+        chart_height = min(900, max(280, len(subgroups) * max(bar_px * len(active_vehicles), 70)))
+        if sub_orientation == "Horizontal":
+            fig2 = px.bar(sub_df, x="Score", y="Subgroup", color="Vehicle", orientation="h", barmode="group", text="Score")
+        else:
+            fig2 = px.bar(sub_df, x="Subgroup", y="Score", color="Vehicle", barmode="group", text="Score")
+            chart_height = min(700, max(360, len(active_vehicles) * 18 + 220))
+        fig2.update_traces(textposition="outside", textfont_size=9)
+        fig2.update_layout(height=chart_height, legend=dict(orientation="h", yanchor="bottom", y=1.02))
         st.plotly_chart(fig2, use_container_width=True)
+        if len(active_vehicles) > 8:
+            st.caption(f"Comparing {len(active_vehicles)} vehicles at once gets crowded — narrow the Market Scope in the sidebar for a cleaner read.")
 
 # ---------------- FEATURE GAP ----------------
 with tabs[5]:
