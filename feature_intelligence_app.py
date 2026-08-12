@@ -43,7 +43,7 @@ try:
     from reportlab.lib import colors
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.units import mm
-    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
     REPORTLAB_AVAILABLE = True
 except ImportError:
@@ -292,6 +292,128 @@ def build_feature_gap_pdf(base_name, competitor_names, category_rows, feature_ga
     story.append(feat_table)
     story.append(Paragraph("Priority Score = (competitor avg − base) × competitor penetration × category weight. "
                             "Table sorted highest priority first — the top rows are the features most worth adding.", caption_style))
+
+    doc.build(story)
+    return buf.getvalue()
+
+
+def _pdf_table(headers, rows, col_widths, navy, header_bg=None):
+    """Shared table styling for the report PDFs — consistent look across sections.
+    Text cells are wrapped in Paragraph objects, not plain strings — plain strings
+    in reportlab Table cells don't wrap and silently overflow into the next
+    column (the exact bug found and fixed in build_feature_gap_pdf earlier;
+    this helper was written without that fix and needed the same one)."""
+    styles = getSampleStyleSheet()
+    cell_style = ParagraphStyle("PdfTableCell", parent=styles["Normal"], fontSize=8, leading=9.5)
+    data = [headers]
+    for r in rows:
+        data.append([Paragraph(str(c), cell_style) if isinstance(c, str) and len(c) > 12 else str(c) for c in r])
+    t = Table(data, colWidths=col_widths, repeatRows=1)
+    t.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), header_bg or navy), ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTSIZE", (0, 0), (-1, -1), 8), ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#DCE3EC")),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F4F6F9")]),
+        ("TOPPADDING", (0, 0), (-1, -1), 4), ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+    ]))
+    return t
+
+
+def build_summary_pdf(vehicles, rep_table, top_priority_rows, best_v, worst_v, base_name, money_fn):
+    """A condensed, one-to-two-page executive summary — headline KPIs, ranked scores,
+    and the top priority features, nothing else."""
+    if not REPORTLAB_AVAILABLE:
+        return None
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, topMargin=18 * mm, bottomMargin=16 * mm, leftMargin=16 * mm, rightMargin=16 * mm)
+    styles = getSampleStyleSheet()
+    navy = colors.HexColor("#0B2559")
+    muted = colors.HexColor("#667085")
+    title_style = ParagraphStyle("T", parent=styles["Title"], textColor=navy, fontSize=20, spaceAfter=2)
+    sub_style = ParagraphStyle("S", parent=styles["Normal"], textColor=muted, fontSize=9.5, spaceAfter=14)
+    h2 = ParagraphStyle("H2", parent=styles["Heading2"], textColor=navy, fontSize=13, spaceBefore=12, spaceAfter=6)
+
+    story = [
+        Paragraph("Feature Intelligence Framework — Executive Summary", title_style),
+        Paragraph(f"{len(vehicles)} vehicles in scope &nbsp;|&nbsp; Base: <b>{base_name}</b> &nbsp;|&nbsp; Generated {datetime.now().strftime('%d %b %Y, %H:%M')}", sub_style),
+        Paragraph("Headline", h2),
+    ]
+    kpi_rows = [["Best in Scope", best_v or "—"], ["Worst in Scope", worst_v or "—"], ["Base Vehicle", base_name or "—"]]
+    story.append(_pdf_table(["Metric", "Vehicle"], kpi_rows, [90 * mm, 90 * mm], navy))
+    story.append(Paragraph("Final Score Ranking", h2))
+    score_headers = list(rep_table[0].keys()) if rep_table else []
+    score_rows = [[r[h] for h in score_headers] for r in rep_table]
+    col_w = [180 * mm / max(1, len(score_headers))] * len(score_headers)
+    story.append(_pdf_table(score_headers, score_rows, col_w, navy))
+    if top_priority_rows:
+        story.append(Paragraph(f"Top Priority Features to Add to {base_name}", h2))
+        ph = ["Feature", "Category", "Priority", "Penetration %"]
+        prows = [[r["Feature"], r["Category"], r["Priority"], r["Penetration %"]] for r in top_priority_rows]
+        story.append(_pdf_table(ph, prows, [70 * mm, 40 * mm, 35 * mm, 35 * mm], navy))
+    doc.build(story)
+    return buf.getvalue()
+
+
+def build_full_pdf(rep_table, matrix_table, vehicles, rows, base_name, money_fn):
+    """The comprehensive version — final scores, the full score matrix, and the
+    complete feature-by-feature audit, one page-friendly table PER VEHICLE.
+
+    A single wide table with 15-20+ vehicle columns is unreadable on a portrait
+    page — headers get compressed into a few unreadable characters each,
+    regardless of font size. A per-vehicle table (Feature / Type / Value, 3
+    columns) is the only version that stays legible at any vehicle count; it
+    runs longer (more pages) by design, which is the right tradeoff for a
+    document meant to be read, not just generated. The Excel export remains
+    the right tool for a wide, all-vehicles-as-columns view."""
+    if not REPORTLAB_AVAILABLE:
+        return None
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, topMargin=16 * mm, bottomMargin=14 * mm, leftMargin=14 * mm, rightMargin=14 * mm)
+    styles = getSampleStyleSheet()
+    navy = colors.HexColor("#0B2559")
+    muted = colors.HexColor("#667085")
+    title_style = ParagraphStyle("T", parent=styles["Title"], textColor=navy, fontSize=20, spaceAfter=2)
+    sub_style = ParagraphStyle("S", parent=styles["Normal"], textColor=muted, fontSize=9.5, spaceAfter=14)
+    h2 = ParagraphStyle("H2", parent=styles["Heading2"], textColor=navy, fontSize=13, spaceBefore=14, spaceAfter=6)
+    cell_style = ParagraphStyle("Cell", parent=styles["Normal"], fontSize=8, leading=9.5)
+
+    story = [
+        Paragraph("Feature Intelligence Framework — Full Report", title_style),
+        Paragraph(f"Base: <b>{base_name}</b> &nbsp;|&nbsp; Generated {datetime.now().strftime('%d %b %Y, %H:%M')} &nbsp;|&nbsp; "
+                  f"{len(rows)} features audited across {len(vehicles)} vehicles", sub_style),
+        Paragraph("Final Score & Category Breakdown", h2),
+    ]
+    if rep_table:
+        headers = list(rep_table[0].keys())
+        trows = [[r[h] for h in headers] for r in rep_table]
+        story.append(_pdf_table(headers, trows, [190 * mm / max(1, len(headers))] * len(headers), navy))
+
+    story.append(Paragraph("Score Matrix", h2))
+    if matrix_table:
+        headers = list(matrix_table[0].keys())
+        trows = [[r[h] for h in headers] for r in matrix_table]
+        story.append(_pdf_table(headers, trows, [190 * mm / max(1, len(headers))] * len(headers), navy))
+
+    for v in vehicles:
+        story.append(PageBreak())
+        story.append(Paragraph(f"Full Feature Audit — {v}", h2))
+        vdata = [["Category", "Feature", "Type", "Value"]]
+        for r in rows:
+            vdata.append([
+                Paragraph(r["category"], cell_style), Paragraph(r["feature"], cell_style),
+                r["type"], Paragraph(str(display_value(r, v)), cell_style),
+            ])
+        vtable = Table(vdata, colWidths=[32 * mm, 78 * mm, 20 * mm, 60 * mm], repeatRows=1)
+        vtable.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), navy), ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTSIZE", (0, 0), (-1, 0), 8), ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#DCE3EC")),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F4F6F9")]),
+            ("TOPPADDING", (0, 0), (-1, -1), 3), ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ]))
+        story.append(vtable)
 
     doc.build(story)
     return buf.getvalue()
@@ -872,7 +994,7 @@ with tabs[0]:
             pen = (sum(1 for o in others if o > 0) / len(others)) if others else 0
             weight = cat_by_name.get(r["category"], {"weight": 0})["weight"]
             priority = max(0, avg_others - base_c) * pen * weight
-            priority_rows.append({"Feature": r["feature"], "Category": r["category"], "Priority": priority, "Penetration %": round(pen * 100)})
+            priority_rows.append({"Feature": r["feature"], "Category": r["category"], "Priority": round(priority, 3), "Penetration %": round(pen * 100)})
         top5 = sorted(priority_rows, key=lambda x: -x["Priority"])[:5]
         if top5:
             fig_top5 = px.bar(pd.DataFrame(top5), x="Priority", y="Feature", orientation="h", color="Category",
@@ -915,6 +1037,7 @@ with tabs[2]:
     seg_filter = st.selectbox("Filter by class", ["All"] + classes)
     pos_data = [{"Vehicle": v, "Price": price_of(v), "Score": final_of(v), "Class": class_of(v), "Features": scores[v]["feature_count"]}
                 for v in vehicles if seg_filter == "All" or class_of(v) == seg_filter]
+    st.subheader("Market Map — Price vs. Score")
     fig = px.scatter(pd.DataFrame(pos_data), x="Price", y="Score", color="Class", size="Features",
                       hover_name="Vehicle", hover_data={"Class": True, "Price": ":.2f", "Score": ":.2f", "Features": True},
                       color_discrete_sequence=CLASS_COLORS)
@@ -924,51 +1047,57 @@ with tabs[2]:
     if len(pos_data) > 10:
         st.caption("Hover a point for the vehicle name \u2014 with this many vehicles, permanent on-chart labels would overlap. Filter by class above for a labeled close-up.")
 
-    col1, col2 = st.columns(2)
-    with col1:
-        st.subheader("Percentile Rank within Class")
-        pct_rows = []
-        for v in vehicles:
-            pool = [final_of(x) for x in vehicles if class_of(x) == class_of(v)]
-            p = percentile_rank(final_of(v), pool)
-            pct_rows.append({"Vehicle": v, "Class": class_of(v), "Score": round(final_of(v), 2),
-                              "PercentileNum": p, "Percentile": f"{p}th (n={len(pool)})"})
-        pct_df = pd.DataFrame(pct_rows).sort_values("PercentileNum", ascending=True)
-        fig_pct = px.bar(pct_df, x="PercentileNum", y="Vehicle", orientation="h", color="Class",
-                          color_discrete_sequence=CLASS_COLORS)
-        fig_pct.update_layout(height=max(280, 26 * len(pct_df)), xaxis_title="Percentile within class", showlegend=False, margin=dict(l=0))
-        st.plotly_chart(fig_pct, use_container_width=True)
-        st.dataframe(pd.DataFrame(pct_rows).drop(columns=["PercentileNum"]), use_container_width=True, hide_index=True)
-    with col2:
-        st.subheader("Feature Penetration Lens")
-        feature_names = sorted(set(r["feature"] for r in rows))
-        chosen_feature = st.selectbox("Feature", feature_names)
-        frow = next((r for r in rows if r["feature"] == chosen_feature), None)
-        if frow:
-            pool = [v for v in vehicles if seg_filter == "All" or class_of(v) == seg_filter]
-            has_it = [v for v in pool if contribution_for(frow, v, cat_by_name, numeric_stats, "relative") > 0]
-            st.metric("Penetration", f"{round(len(has_it)/len(pool)*100) if pool else 0}%")
+    st.markdown("---")
+    st.subheader("Feature Penetration Lens")
+    feature_names = sorted(set(r["feature"] for r in rows))
+    chosen_feature = st.selectbox("Feature", feature_names)
+    frow = next((r for r in rows if r["feature"] == chosen_feature), None)
+    if frow:
+        pool = [v for v in vehicles if seg_filter == "All" or class_of(v) == seg_filter]
+        has_it = [v for v in pool if contribution_for(frow, v, cat_by_name, numeric_stats, "relative") > 0]
+        pen_pct = round(len(has_it) / len(pool) * 100) if pool else 0
+        pc1, pc2 = st.columns([1, 3])
+        with pc1:
+            st.metric("Penetration", f"{pen_pct}%")
+        with pc2:
+            st.markdown("<div style='padding-top: 28px;'></div>", unsafe_allow_html=True)
+            st.progress(pen_pct / 100, text=f"{len(has_it)} of {len(pool)} vehicles have this feature")
 
-            if frow["type"] != "Categorical" and pool:
-                mult = cat_by_name.get(frow["category"], {"multiplier": 1})["multiplier"]
-                scatter_rows = [{
-                    "Vehicle": v, "Price": price_of(v), "Class": class_of(v),
-                    "Feature Level": round(contribution_for(frow, v, cat_by_name, numeric_stats, "relative") / mult, 2) if mult else 0,
-                    "Value": display_value(frow, v),
-                } for v in pool]
-                fig_pen = px.scatter(pd.DataFrame(scatter_rows), x="Price", y="Feature Level", color="Class",
-                                      hover_name="Vehicle", hover_data={"Class": True, "Value": True, "Price": ":.2f", "Feature Level": ":.2f"},
-                                      color_discrete_sequence=CLASS_COLORS)
-                fig_pen.update_traces(marker=dict(size=12, line=dict(width=1, color="white")))
-                fig_pen.update_layout(
-                    height=380, yaxis=dict(range=[-0.1, 1.1]),
-                    yaxis_title="Feature Level (0 = absent, 1 = best available)",
-                    xaxis=dict(automargin=True),
-                )
-                st.plotly_chart(fig_pen, use_container_width=True)
-                st.caption("Hover a point for the vehicle name and exact value — labels are hidden by default so they stay readable as more vehicles are added.")
-            st.dataframe(pd.DataFrame([{"Vehicle": v, "Value": display_value(frow, v)} for v in pool]),
-                         use_container_width=True, hide_index=True)
+        if frow["type"] != "Categorical" and pool:
+            mult = cat_by_name.get(frow["category"], {"multiplier": 1})["multiplier"]
+            scatter_rows = [{
+                "Vehicle": v, "Price": price_of(v), "Class": class_of(v),
+                "Feature Level": round(contribution_for(frow, v, cat_by_name, numeric_stats, "relative") / mult, 2) if mult else 0,
+                "Value": display_value(frow, v),
+            } for v in pool]
+            fig_pen = px.scatter(pd.DataFrame(scatter_rows), x="Price", y="Feature Level", color="Class",
+                                  hover_name="Vehicle", hover_data={"Class": True, "Value": True, "Price": ":.2f", "Feature Level": ":.2f"},
+                                  color_discrete_sequence=CLASS_COLORS)
+            fig_pen.update_traces(marker=dict(size=12, line=dict(width=1, color="white")))
+            fig_pen.update_layout(
+                height=380, yaxis=dict(range=[-0.1, 1.1]),
+                yaxis_title="Feature Level (0 = absent, 1 = best available)",
+                xaxis=dict(automargin=True),
+            )
+            st.plotly_chart(fig_pen, use_container_width=True)
+            st.caption("Hover a point for the vehicle name and exact value — labels are hidden by default so they stay readable as more vehicles are added.")
+        st.dataframe(pd.DataFrame([{"Vehicle": v, "Value": display_value(frow, v)} for v in pool]),
+                     use_container_width=True, hide_index=True)
+
+    st.markdown("---")
+    st.subheader("Percentile Rank within Class")
+    pct_rows = []
+    for v in vehicles:
+        pool2 = [final_of(x) for x in vehicles if class_of(x) == class_of(v)]
+        p = percentile_rank(final_of(v), pool2)
+        pct_rows.append({"Vehicle": v, "Class": class_of(v), "Score": round(final_of(v), 2),
+                          "PercentileNum": p, "Percentile": f"{p}th (n={len(pool2)})"})
+    pct_df = pd.DataFrame(pct_rows).sort_values("PercentileNum", ascending=True)
+    fig_pct = px.bar(pct_df, x="PercentileNum", y="Vehicle", orientation="h", color="Class",
+                      color_discrete_sequence=CLASS_COLORS)
+    fig_pct.update_layout(height=max(280, 26 * len(pct_df)), xaxis_title="Percentile within class", showlegend=False, margin=dict(l=0))
+    st.plotly_chart(fig_pct, use_container_width=True)
+    st.dataframe(pd.DataFrame(pct_rows).drop(columns=["PercentileNum"]), use_container_width=True, hide_index=True)
 
 # ---------------- SCORE COMPARISON ----------------
 with tabs[3]:
@@ -1008,10 +1137,25 @@ with tabs[4]:
     fig.update_layout(height=420, legend=dict(orientation="h", yanchor="bottom", y=1.02))
     st.plotly_chart(fig, use_container_width=True)
 
+    st.subheader(f"Top & Bottom per Category — Gap vs {base}")
+    tb_rows = []
+    for c in cat_names:
+        ranked_c = sorted(active_vehicles, key=lambda v: cat_score_of(v, c), reverse=True)
+        top_v, bottom_v = ranked_c[0], ranked_c[-1]
+        tb_rows.append({
+            "Category": c,
+            "Top Vehicle": top_v, "Top Score": round(cat_score_of(top_v, c), 2),
+            "Bottom Vehicle": bottom_v, "Bottom Score": round(cat_score_of(bottom_v, c), 2),
+            f"{base} Score": round(cat_score_of(base, c), 2) if base else "—",
+            f"Gap vs {base}": (f"{cat_score_of(top_v, c) - cat_score_of(base, c):+.2f}" if base else "—"),
+        })
+    st.dataframe(pd.DataFrame(tb_rows), use_container_width=True, hide_index=True)
+    st.caption(f"\"Gap vs {base}\" is the top vehicle's lead over your selected base in that category — the size of the ceiling still to close.")
+
     st.subheader("Subgroup Analysis")
     sc1, sc2 = st.columns([3, 1])
     sub_cat = sc1.selectbox("Category", cat_names, key="subgroup_cat")
-    sub_orientation = sc2.radio("Orientation", ["Horizontal", "Vertical"], key="subgroup_orientation")
+    sub_orientation = sc2.radio("Orientation", ["Vertical", "Horizontal"], key="subgroup_orientation")
     subgroups = []
     seen = set()
     for r in rows:
@@ -1025,12 +1169,13 @@ with tabs[4]:
     if sub_records:
         sub_df = pd.DataFrame(sub_records)
         bar_px = min(22, max(10, 260 // max(1, len(active_vehicles))))  # thinner bars as vehicle count grows, never disappearing
-        chart_height = min(900, max(280, len(subgroups) * max(bar_px * len(active_vehicles), 70)))
         if sub_orientation == "Horizontal":
+            chart_height = min(900, max(280, len(subgroups) * max(bar_px * len(active_vehicles), 70)))
             fig2 = px.bar(sub_df, x="Score", y="Subgroup", color="Vehicle", orientation="h", barmode="group", text="Score")
         else:
+            chart_height = min(650, max(380, 320 + len(active_vehicles) * 8))
             fig2 = px.bar(sub_df, x="Subgroup", y="Score", color="Vehicle", barmode="group", text="Score")
-            chart_height = min(700, max(360, len(active_vehicles) * 18 + 220))
+            fig2.update_layout(xaxis=dict(tickangle=-20, automargin=True))
         fig2.update_traces(textposition="outside", textfont_size=9)
         fig2.update_layout(height=chart_height, legend=dict(orientation="h", yanchor="bottom", y=1.02))
         st.plotly_chart(fig2, use_container_width=True)
@@ -1047,14 +1192,19 @@ with tabs[5]:
     filtered_rows = [r for r in rows if gap_cat == "All" or r["category"] == gap_cat]
 
     if perspective == "Vehicle":
-        for v in competitors:
-            st.markdown(f"**{v}**")
-            data = [{"Category": c, "Gap": cat_score_of(v, c) - cat_score_of(base, c)} for c in cat_names]
-            fig = px.bar(pd.DataFrame(data), x="Category", y="Gap", color=pd.DataFrame(data)["Gap"] >= 0,
-                         color_discrete_map={True: POSITIVE, False: NEGATIVE})
-            fig.update_layout(height=220, showlegend=False)
-            fig.add_hline(y=0, line_color="#94A3B8")
-            st.plotly_chart(fig, use_container_width=True)
+        n_per_row = 3 if len(competitors) >= 3 else max(1, len(competitors))
+        for i in range(0, len(competitors), n_per_row):
+            row_vehicles = competitors[i:i + n_per_row]
+            row_cols = st.columns(len(row_vehicles))
+            for col, v in zip(row_cols, row_vehicles):
+                with col:
+                    st.markdown(f"**{v}**")
+                    data = [{"Category": c, "Gap": cat_score_of(v, c) - cat_score_of(base, c)} for c in cat_names]
+                    fig = px.bar(pd.DataFrame(data), x="Category", y="Gap", color=pd.DataFrame(data)["Gap"] >= 0,
+                                 color_discrete_map={True: POSITIVE, False: NEGATIVE})
+                    fig.update_layout(height=260, showlegend=False, margin=dict(l=0, r=0))
+                    fig.add_hline(y=0, line_color="#94A3B8")
+                    st.plotly_chart(fig, use_container_width=True)
     else:
         gap_table = []
         for r in filtered_rows:
@@ -1068,7 +1218,7 @@ with tabs[5]:
             weight = cat_by_name.get(r["category"], {"weight": 0})["weight"]
             priority = max(0, avg_others - base_c) * (pen / 100) * weight
             gap_table.append({"Category": r["category"], "Type": r["type"], "Feature": r["feature"],
-                               base: display_value(r, base), "Penetration %": pen, "Verdict": verdict, "Priority": round(priority, 4)})
+                               base: display_value(r, base), "Penetration %": pen, "Verdict": verdict, "Priority": round(priority, 3)})
         gap_table.sort(key=lambda x: -x["Priority"])
         top10 = [g for g in gap_table if g["Priority"] > 0][:10]
         if top10:
@@ -1093,8 +1243,12 @@ with tabs[5]:
 with tabs[6]:
     radar_mode = st.radio("Mode", ["Overlay All", "Base vs Each"], horizontal=True)
     if radar_mode == "Overlay All":
+        radar_selection = st.multiselect("Vehicles to show", active_vehicles, default=active_vehicles[:6] if len(active_vehicles) > 6 else active_vehicles)
+        radar_vehicles = radar_selection if radar_selection else active_vehicles
+        if len(active_vehicles) > 6 and len(radar_selection) == len(active_vehicles[:6]):
+            st.caption(f"Showing 6 of {len(active_vehicles)} vehicles by default — too many overlapping shapes gets unreadable. Add or remove vehicles above.")
         fig = go.Figure()
-        for v in active_vehicles:
+        for v in radar_vehicles:
             vals = [cat_score_of(v, c) for c in cat_names] + [cat_score_of(v, cat_names[0])]
             fig.add_trace(go.Scatterpolar(r=vals, theta=cat_names + [cat_names[0]], fill="toself" if v == base else None,
                                            name=v, opacity=0.85 if v == base else 0.5))
@@ -1183,6 +1337,28 @@ with tabs[8]:
         fig = px.bar(pd.DataFrame(vfm), x="VFM", y="Vehicle", orientation="h", color_discrete_sequence=["#F59E0B"])
         fig.update_layout(height=420)
         st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("---")
+    col3, col4 = st.columns(2)
+    with col3:
+        st.subheader("Average Category Gap (all competitors)")
+        avg_gap_rows = [{"Category": c, "Avg Gap": (sum(cat_score_of(v, c) for v in non_base) / len(non_base) - cat_score_of(base, c)) if non_base else 0}
+                         for c in cat_names]
+        fig_avg = px.bar(pd.DataFrame(avg_gap_rows), x="Category", y="Avg Gap",
+                          color=pd.DataFrame(avg_gap_rows)["Avg Gap"] >= 0, color_discrete_map={True: POSITIVE, False: NEGATIVE})
+        fig_avg.update_layout(height=340, showlegend=False)
+        fig_avg.add_hline(y=0, line_color="#94A3B8")
+        st.plotly_chart(fig_avg, use_container_width=True)
+        st.caption(f"Positive = competitors average ahead of {base} in that category; negative = {base} leads on average.")
+    with col4:
+        st.subheader("VFM vs. Price")
+        vfm_scatter = pd.DataFrame([{"Vehicle": v, "Price": price_of(v), "VFM": final_of(v) / price_of(v) if price_of(v) > 0 else 0, "Class": class_of(v)} for v in active_vehicles])
+        fig_vfm = px.scatter(vfm_scatter, x="Price", y="VFM", color="Class", hover_name="Vehicle",
+                              hover_data={"Class": True, "Price": ":.2f", "VFM": ":.2f"}, color_discrete_sequence=CLASS_COLORS)
+        fig_vfm.update_traces(marker=dict(size=12, line=dict(width=1, color="white")))
+        fig_vfm.update_layout(height=340, xaxis=dict(automargin=True))
+        st.plotly_chart(fig_vfm, use_container_width=True)
+        st.caption("Top-left = high value-for-money at a low price. Hover for vehicle names.")
 
 # ---------------- VARIANT ANALYSIS ----------------
 with tabs[9]:
@@ -1401,11 +1577,59 @@ with tabs[12]:
     st.plotly_chart(fig_rep, use_container_width=True)
     st.dataframe(report_df, use_container_width=True, hide_index=True)
 
-    # Downloadable Excel report
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        report_df.to_excel(writer, sheet_name="Final Scores", index=False)
-        pd.DataFrame(matrix_rows if "matrix_rows" in dir() else []).to_excel(writer, sheet_name="Score Matrix", index=False)
-        audit_df.to_excel(writer, sheet_name="Audit Trail", index=False)
-    st.download_button("Download Full Report (Excel)", buf.getvalue(), "feature-intelligence-report.xlsx",
-                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    st.markdown("---")
+    st.subheader("Overall Vehicle Summary — every key detail, one row per vehicle")
+    fr_dist_report = [scores[v]["feature_rating"] for v in report_vehicles]
+    summary_rows = []
+    for v in report_ranked:
+        pool = [final_of(x) for x in vehicles if class_of(x) == class_of(v)]
+        summary_rows.append({
+            "Vehicle": v, "Class": class_of(v), "Price": money(price_of(v)),
+            "Safety": round(cat_score_of(v, "Safety"), 2) if "Safety" in cat_names else "—",
+            "Comfort": round(cat_score_of(v, "Comfort"), 2) if "Comfort" in cat_names else "—",
+            "Technology": round(cat_score_of(v, "Technology"), 2) if "Technology" in cat_names else "—",
+            "Utility": round(cat_score_of(v, "Utility"), 2) if "Utility" in cat_names else "—",
+            "Final Score": round(final_of(v), 2),
+            "Tier": tier_label_relative(scores[v]["feature_rating"], fr_dist_report)[0],
+            "VFM (Score \u00f7 Price)": round(final_of(v) / price_of(v), 3) if price_of(v) > 0 else "—",
+            "Percentile in Class": f"{percentile_rank(final_of(v), pool)}th",
+            "Features Present": scores[v]["feature_count"],
+            "Base Vehicle?": "Yes" if v == base else "No",
+        })
+    summary_df = pd.DataFrame(summary_rows)
+    st.dataframe(summary_df, use_container_width=True, hide_index=True)
+    st.caption("This table is also included as its own sheet in the Excel export below, and drives both PDF report options.")
+
+    st.markdown("---")
+    st.subheader("Downloads")
+    dcol1, dcol2, dcol3 = st.columns(3)
+    with dcol1:
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+            summary_df.to_excel(writer, sheet_name="Vehicle Summary", index=False)
+            report_df.to_excel(writer, sheet_name="Final Scores", index=False)
+            pd.DataFrame(matrix_rows if "matrix_rows" in dir() else []).to_excel(writer, sheet_name="Score Matrix", index=False)
+            audit_df.to_excel(writer, sheet_name="Audit Trail", index=False)
+        st.download_button("\U0001F4CA Full Report (Excel)", buf.getvalue(), "feature-intelligence-report.xlsx",
+                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+    with dcol2:
+        if REPORTLAB_AVAILABLE:
+            top_priority_for_pdf = sorted(
+                [{"Feature": r["feature"], "Category": r["category"],
+                  "Priority": round(max(0, (sum(contribution_for(r, v, cat_by_name, numeric_stats, "relative") for v in [x for x in report_vehicles if x != base]) / max(1, len([x for x in report_vehicles if x != base])) - contribution_for(r, base, cat_by_name, numeric_stats, "relative"))) * cat_by_name.get(r["category"], {"weight": 0})["weight"], 3),
+                  "Penetration %": round(sum(1 for v in [x for x in report_vehicles if x != base] if contribution_for(r, v, cat_by_name, numeric_stats, "relative") > 0) / max(1, len([x for x in report_vehicles if x != base])) * 100)}
+                 for r in rows], key=lambda x: -x["Priority"])[:8]
+            summary_pdf_bytes = build_summary_pdf(report_vehicles, rep_table, top_priority_for_pdf, report_ranked[0] if report_ranked else None,
+                                                   report_ranked[-1] if report_ranked else None, base, money)
+            st.download_button("\U0001F4C4 Summary Report (PDF)", summary_pdf_bytes, "feature-intelligence-summary.pdf",
+                                "application/pdf", use_container_width=True)
+        else:
+            st.button("\U0001F4C4 Summary Report (PDF)", disabled=True, use_container_width=True, help="reportlab not installed")
+    with dcol3:
+        if REPORTLAB_AVAILABLE:
+            full_pdf_bytes = build_full_pdf(rep_table, matrix_rows if "matrix_rows" in dir() else [], report_vehicles, rows, base, money)
+            st.download_button("\U0001F4D1 Full Report (PDF, all pages)", full_pdf_bytes, "feature-intelligence-full-report.pdf",
+                                "application/pdf", use_container_width=True)
+            st.caption("The full PDF includes one readable table per vehicle — every tracked feature, so it runs long by design (roughly one page per vehicle). Use the Summary PDF for a quick read.")
+        else:
+            st.button("\U0001F4D1 Full Report (PDF, all pages)", disabled=True, use_container_width=True, help="reportlab not installed")
