@@ -151,6 +151,17 @@ def compute_scores(vehicles, rows, category_config, relevance, numeric_mode, num
         for c in cat_names
     }
 
+    def is_researched(r, v):
+        """Whether this specific feature has an actual value for this vehicle, as
+        opposed to a genuinely-unresearched blank. Only reliable for Numeric —
+        a blank Tier/Binary cell defaults to its lowest level, indistinguishable
+        from "we checked and it's genuinely the lowest," so those stay counted
+        as researched either way (excluding them would misrepresent real
+        absences as unknowns)."""
+        if r["type"] == "Numeric":
+            return r["values"].get(v) not in (None, "", "nan")
+        return True
+
     per_vehicle = {}
     for v in vehicles:
         category_scores = {c: 0.0 for c in cat_names}
@@ -168,10 +179,23 @@ def compute_scores(vehicles, rows, category_config, relevance, numeric_mode, num
         normalized = {c: (category_scores[c] / max_category_raw[c] * 10 if max_category_raw[c] > 0 else 0.0) for c in cat_names}
         feature_rating = (sum(normalized.values()) / len(cat_names)) if cat_names else 0.0
 
+        # Documented Quality — same contributions, but the denominator only
+        # counts features actually researched for this vehicle, so a
+        # thoroughly (if narrowly) documented vehicle can reach 100%.
+        researched_max = {
+            c: sum(category_by_name[c]["multiplier"] for r in scorable if r["category"] == c and is_researched(r, v))
+            for c in cat_names
+        }
+        documented_normalized = {c: (category_scores[c] / researched_max[c] * 10 if researched_max[c] > 0 else 0.0) for c in cat_names}
+        documented_quality = (sum(documented_normalized.values()) / len(cat_names)) if cat_names else 0.0
+        researched_count = sum(1 for r in scorable if is_researched(r, v))
+        research_completeness = (researched_count / len(scorable)) if scorable else 0.0
+
         per_vehicle[v] = {
             "category_scores": category_scores, "customer_category_scores": customer_category_scores,
             "engineering_final": engineering_final, "customer_final": customer_final,
             "feature_count": feature_count, "normalized_category": normalized, "feature_rating": feature_rating,
+            "documented_quality": documented_quality, "research_completeness": research_completeness,
         }
     return per_vehicle
 
@@ -971,6 +995,41 @@ with tabs[0]:
     st.plotly_chart(fig_market, use_container_width=True)
     st.caption("Ranked by Final Score across every vehicle currently in scope — this is the headline market view. Everything below explains a specific piece of it.")
 
+    g1, g2, g3 = st.columns(3)
+    with g1:
+        class_counts = pd.Series([class_of(v) for v in active_vehicles]).value_counts().reset_index()
+        class_counts.columns = ["Class", "Count"]
+        fig_donut = px.pie(class_counts, names="Class", values="Count", hole=0.55, color="Class", color_discrete_sequence=CLASS_COLORS)
+        fig_donut.update_traces(textinfo="label+percent", textposition="outside")
+        fig_donut.update_layout(height=280, showlegend=False, margin=dict(t=10, b=10), title=dict(text="Segment Mix", font=dict(size=13, color="#0B2559")))
+        st.plotly_chart(fig_donut, use_container_width=True)
+    with g2:
+        gauge_score = final_of(best_vehicle) if best_vehicle else 0
+        gauge_max = max((final_of(v) for v in active_vehicles), default=1) * 1.15 or 1
+        fig_gauge = go.Figure(go.Indicator(
+            mode="gauge+number", value=gauge_score,
+            number={"font": {"color": "#0B2559", "size": 28}},
+            gauge={
+                "axis": {"range": [0, gauge_max], "tickfont": {"size": 9}},
+                "bar": {"color": ACCENT},
+                "steps": [
+                    {"range": [0, gauge_max * 0.5], "color": "#FDECEC"},
+                    {"range": [gauge_max * 0.5, gauge_max * 0.75], "color": "#FFF6E5"},
+                    {"range": [gauge_max * 0.75, gauge_max], "color": "#E7F6EC"},
+                ],
+            },
+        ))
+        fig_gauge.update_layout(height=280, margin=dict(t=40, b=10), title=dict(text=f"Market Leader Score \u2014 {best_vehicle or '\u2014'}", font=dict(size=13, color="#0B2559")))
+        st.plotly_chart(fig_gauge, use_container_width=True)
+    with g3:
+        weight_df = pd.DataFrame([{"Category": c["name"], "Weight": c["weight"]} for c in category_config if c["weight"] > 0])
+        if not weight_df.empty:
+            fig_weight = px.pie(weight_df, names="Category", values="Weight", hole=0.55,
+                                 color="Category", color_discrete_map={c["name"]: c["color"] for c in category_config})
+            fig_weight.update_traces(textinfo="label+percent", textposition="outside")
+            fig_weight.update_layout(height=280, showlegend=False, margin=dict(t=10, b=10), title=dict(text="Category Weight Mix", font=dict(size=13, color="#0B2559")))
+            st.plotly_chart(fig_weight, use_container_width=True)
+
     st.markdown("---")
     c1, c2, c3, c4 = st.columns(4)
     if best_vehicle:
@@ -980,10 +1039,25 @@ with tabs[0]:
         c1.metric("Market Leader", "—")
     c2.metric("Needs the Most Work", worst_vehicle, f"{final_of(worst_vehicle):.2f}" if worst_vehicle else "—")
     if len(non_base) >= 2:
-        hp = max(non_base, key=lambda v: gaps[v])
-        hn = min(non_base, key=lambda v: gaps[v])
-        hp_label = "Highest Positive Gap" if gaps[hp] > 0 else "Closest Competitor (still behind base)"
-        hn_label = "Highest Negative Gap" if gaps[hn] < 0 else "Weakest Competitor (still ahead of base)"
+        gap_ranked = sorted(non_base, key=lambda v: gaps[v], reverse=True)
+        hp = gap_ranked[0]
+        # If the single biggest lead over base is trivially the same vehicle as the
+        # overall Market Leader (already shown in card 1), that's mathematically
+        # correct but wastes a card — show the runner-up so all 4 cards say something new.
+        if hp == best_vehicle and len(gap_ranked) > 1:
+            hp = gap_ranked[1]
+            hp_note = " (2nd, after Market Leader)"
+        else:
+            hp_note = ""
+        gap_ranked_asc = sorted(non_base, key=lambda v: gaps[v])
+        hn = gap_ranked_asc[0]
+        if hn == worst_vehicle and len(gap_ranked_asc) > 1:
+            hn = gap_ranked_asc[1]
+            hn_note = " (2nd, after Needs the Most Work)"
+        else:
+            hn_note = ""
+        hp_label = ("Highest Positive Gap" if gaps[hp] > 0 else "Closest Competitor (still behind base)") + hp_note
+        hn_label = ("Highest Negative Gap" if gaps[hn] < 0 else "Weakest Competitor (still ahead of base)") + hn_note
         c3.metric(hp_label, hp, fmt_signed(gaps[hp]))
         c4.metric(hn_label, hn, fmt_signed(gaps[hn]))
     elif len(non_base) == 1:
@@ -1017,7 +1091,7 @@ with tabs[0]:
                          key=lambda x: -x["Gap"])
             fig = px.bar(pd.DataFrame(rec), x="Gap", y="Category", orientation="h",
                          color="Gap", color_continuous_scale=["#DC2626", "#94A3B8", ACCENT])
-            fig.update_layout(height=300, showlegend=False, coloraxis_showscale=False)
+            fig.update_layout(height=300, showlegend=False, coloraxis_showscale=False, yaxis=dict(autorange="reversed"))
             st.plotly_chart(fig, use_container_width=True)
             st.caption(f"Positive bars = categories where {best_competitor} leads {base}. Formula: {best_competitor}'s category score minus {base}'s, for each category.")
     with col2:
@@ -1314,10 +1388,17 @@ with tabs[7]:
         for c in cat_names:
             row[c] = round(scores[v]["normalized_category"].get(c, 0), 1)
         row["Feature Rating /10"] = round(scores[v]["feature_rating"], 1)
+        row["Documented Quality %"] = round(scores[v]["documented_quality"] * 10, 1)
+        row["Researched %"] = round(scores[v]["research_completeness"] * 100)
         row["Tier"] = tier_label_relative(scores[v]["feature_rating"], fr_distribution)[0]
         matrix_rows.append(row)
     matrix_df = pd.DataFrame(matrix_rows)
     st.caption("Tiers (Strong / Moderate / Below Avg / Weak) are ranked relative to the vehicles currently in scope, not a fixed absolute scale \u2014 as verified data gets deeper, the same vehicle's tier can shift even if its own score doesn't change.")
+    with st.expander("Feature Rating vs. Documented Quality — what's the difference?"):
+        st.markdown(
+            "**Feature Rating** (conservative, used for the Tier and every ranking elsewhere in the tool) treats an unresearched feature the same as a confirmed absence — this is what makes cross-vehicle comparison fair, and why even the best-researched vehicle here doesn't approach 10/10.\n\n"
+            "**Documented Quality** scores a vehicle only against the *Numeric* features actually researched for it, so a narrowly-but-thoroughly documented vehicle scores higher here than on Feature Rating. It does **not** fully solve the gap, though: most of the remaining low scores come from Tier-type features left at their default level, and a blank Tier cell is indistinguishable from a genuinely-confirmed lowest level in the current data model — so Documented Quality still can't cleanly separate \"we checked, it doesn't have this\" from \"we haven't checked yet\" for those. Closing that fully would need an explicit researched/unresearched flag per cell, which isn't in the data model yet."
+        )
 
     def _tier_bg_col(col):
         dist = col.tolist()
@@ -1374,7 +1455,7 @@ with tabs[8]:
         st.subheader("Value for Money (Final Score ÷ Price)")
         vfm = sorted([{"Vehicle": v, "VFM": final_of(v) / price_of(v) if price_of(v) > 0 else 0} for v in active_vehicles], key=lambda x: -x["VFM"])
         fig = px.bar(pd.DataFrame(vfm), x="VFM", y="Vehicle", orientation="h", color_discrete_sequence=["#F59E0B"])
-        fig.update_layout(height=420)
+        fig.update_layout(height=420, yaxis=dict(autorange="reversed"))
         st.plotly_chart(fig, use_container_width=True)
 
     st.markdown("---")
