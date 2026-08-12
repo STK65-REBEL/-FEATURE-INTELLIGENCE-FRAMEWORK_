@@ -102,7 +102,10 @@ def contribution_for(row, vehicle, category_by_name, numeric_stats, numeric_mode
         frac = (idx / max_idx) if max_idx > 0 else 0.0
         return frac * mult
     if row["type"] == "Numeric":
-        num = float(val) if (val not in (None, "", "nan")) else 0.0
+        is_missing = val in (None, "", "nan")
+        if is_missing:
+            return 0.0  # unresearched — no credit, and never compared against a scale it isn't part of
+        num = float(val)
         if numeric_mode == "fixed" and row.get("ceiling"):
             frac = max(0.0, min(1.0, num / row["ceiling"]))
         else:
@@ -111,6 +114,7 @@ def contribution_for(row, vehicle, category_by_name, numeric_stats, numeric_mode
                 frac = (num - stat["min"]) / (stat["max"] - stat["min"])
             else:
                 frac = 1.0 if stat["max"] > 0 else 0.0
+            frac = max(0.0, min(1.0, frac))  # defensive clamp — a contribution can never be negative or exceed the multiplier
         return frac * mult
     return 0.0
 
@@ -199,6 +203,30 @@ def tier_label(score):
     return "Weak", "#DC2626", "#FDECEC"
 
 
+def tier_label_relative(score, distribution):
+    """Classifies a score against the CURRENT dataset's actual spread (quartiles),
+    not a fixed absolute scale. With real-world research still being built out,
+    fixed 8/6/4 cutoffs made every single vehicle read as "Weak" — even the
+    best-researched one — because nothing in the dataset yet reaches that absolute
+    bar. Quartile-based tiers stay meaningful today and keep recalibrating
+    automatically as more verified data gets added, instead of needing a manual
+    threshold change later."""
+    dist = [d for d in distribution if d is not None]
+    if len(set(dist)) <= 1:
+        return "Moderate", "#0EA5E9", "#E8F6FD"
+    sorted_d = sorted(dist)
+    n = len(sorted_d)
+
+    def pct(p):
+        idx = min(n - 1, max(0, int(round(p * (n - 1)))))
+        return sorted_d[idx]
+
+    if score >= pct(0.75): return "Strong", "#16A34A", "#E7F6EC"
+    if score >= pct(0.50): return "Moderate", "#0EA5E9", "#E8F6FD"
+    if score >= pct(0.25): return "Below Avg", "#F59E0B", "#FFF6E5"
+    return "Weak", "#DC2626", "#FDECEC"
+
+
 def build_feature_gap_pdf(base_name, competitor_names, category_rows, feature_gap_rows, money_fn):
     """Builds a clean, presentable Feature Gap PDF for one base vehicle vs one or more
     competitors. Returns bytes, or None if reportlab isn't installed."""
@@ -272,6 +300,12 @@ def build_feature_gap_pdf(base_name, competitor_names, category_rows, feature_ga
 # ============================================================================
 # EXCEL / JSON LOADING & SAVING — same schema as the standardized workbook
 # ============================================================================
+KNOWN_TAXONOMY_CATEGORIES = {
+    "Safety", "Comfort", "Technology", "Utility",
+    "Powertrain & Performance", "Dimensions & Weight", "Environmental & Compliance", "Ownership & Cost",
+}
+
+
 def parse_excel_bytes(file_bytes, known_category_names=None):
     """Parses the standard Feature Matrix sheet layout into rows/vehicles/price/class."""
     xls = pd.ExcelFile(io.BytesIO(file_bytes))
@@ -310,9 +344,8 @@ def parse_excel_bytes(file_bytes, known_category_names=None):
         meta_raw = str(r[cols[2]]).strip() if pd.notna(r[cols[2]]) else ""
         is_header = (not type_raw) and (not meta_raw) and all(pd.isna(v) or str(v).strip() == "" for v in vals_raw)
         if is_header:
-            if known_category_names and feature in known_category_names:
-                cur_cat, cur_sub = feature, None
-            elif not known_category_names and feature.lower() in ("safety", "comfort", "technology", "utility"):
+            all_known = KNOWN_TAXONOMY_CATEGORIES | (set(known_category_names) if known_category_names else set())
+            if feature in all_known or feature.lower() in ("safety", "comfort", "technology", "utility"):
                 cur_cat, cur_sub = feature, None
             else:
                 cur_sub = feature
@@ -514,6 +547,66 @@ h2, h3 { font-weight: 700 !important; color: #0B2559 !important; }
 
 /* ---- Divider lines lighter ---- */
 hr { border-color: #DCE3EC !important; }
+
+/* ================= HIGH-END POLISH PASS ================= */
+
+/* Subtle branded title bar — gradient wash, not a flat block */
+.main h1 {
+  background: linear-gradient(135deg, #0B2559 0%, #13316B 60%, #1D4ED8 140%);
+  color: #FFFFFF !important;
+  padding: 22px 28px 18px 28px;
+  border-radius: 14px;
+  margin-bottom: 4px;
+  box-shadow: 0 8px 24px rgba(11,37,89,0.18);
+}
+
+/* Layered, softer shadows on every card surface — reads as elevation, not a flat border */
+[data-testid="stMetric"] {
+  box-shadow: 0 1px 2px rgba(11,37,89,0.04), 0 6px 16px rgba(11,37,89,0.07);
+  transition: box-shadow 0.15s ease, transform 0.15s ease;
+}
+[data-testid="stMetric"]:hover { box-shadow: 0 2px 4px rgba(11,37,89,0.06), 0 10px 24px rgba(11,37,89,0.11); transform: translateY(-1px); }
+
+/* Subheaders get a touch of hierarchy without a forbidden accent stripe */
+h3 { letter-spacing: -0.01em; margin-top: 0.4rem !important; }
+
+/* Tabs: subtle icon-style bullet + smoother hover */
+.stTabs [data-baseweb="tab"] { transition: color 0.12s ease; }
+.stTabs [data-baseweb="tab"]:hover { color: #1D4ED8; }
+
+/* Buttons: soft depth + smoother press feel */
+.main .stButton button {
+  box-shadow: 0 1px 2px rgba(11,37,89,0.05);
+  transition: all 0.12s ease;
+}
+.main .stButton button:hover { box-shadow: 0 3px 10px rgba(29,78,216,0.15); transform: translateY(-1px); }
+.main .stButton button:active { transform: translateY(0); box-shadow: none; }
+
+/* Primary-looking buttons (Add / Apply / Download) get real weight */
+.main .stButton button p { font-weight: 700; }
+.main .stDownloadButton button {
+  background: #1D4ED8; color: #FFFFFF; border: none; font-weight: 700;
+  box-shadow: 0 2px 8px rgba(29,78,216,0.22);
+}
+.main .stDownloadButton button:hover { background: #2563EB; box-shadow: 0 4px 14px rgba(29,78,216,0.3); }
+
+/* Dataframes: crisper edges, subtle elevation */
+.stDataFrame { box-shadow: 0 1px 2px rgba(11,37,89,0.04), 0 4px 12px rgba(11,37,89,0.05); }
+
+/* Plotly charts: give them the same card frame as everything else */
+[data-testid="stPlotlyChart"] {
+  background: #FFFFFF; border: 1px solid #DCE3EC; border-radius: 10px; padding: 8px;
+  box-shadow: 0 1px 2px rgba(11,37,89,0.04), 0 4px 12px rgba(11,37,89,0.05);
+}
+
+/* Tighter, more deliberate vertical rhythm between blocks */
+.main .block-container [data-testid="stVerticalBlock"] > div { margin-bottom: 2px; }
+
+/* Selectbox/input focus states in a brand-consistent blue, not browser default */
+[data-baseweb="select"]:focus-within, input:focus { outline: 2px solid #1D4ED8 !important; outline-offset: 1px; }
+
+/* Form containers: crisper, more deliberate card */
+[data-testid="stForm"] { border-radius: 12px !important; box-shadow: 0 1px 2px rgba(11,37,89,0.04), 0 6px 16px rgba(11,37,89,0.06); }
 </style>
 """, unsafe_allow_html=True)
 
@@ -781,6 +874,11 @@ with tabs[0]:
             priority = max(0, avg_others - base_c) * pen * weight
             priority_rows.append({"Feature": r["feature"], "Category": r["category"], "Priority": priority, "Penetration %": round(pen * 100)})
         top5 = sorted(priority_rows, key=lambda x: -x["Priority"])[:5]
+        if top5:
+            fig_top5 = px.bar(pd.DataFrame(top5), x="Priority", y="Feature", orientation="h", color="Category",
+                               color_discrete_map={catCfg["name"]: catCfg["color"] for catCfg in category_config})
+            fig_top5.update_layout(height=260, yaxis=dict(autorange="reversed"), showlegend=False, margin=dict(l=0))
+            st.plotly_chart(fig_top5, use_container_width=True)
         st.dataframe(pd.DataFrame(top5), use_container_width=True, hide_index=True)
         st.caption("Priority = (competitor avg − base) × competitor penetration × category weight")
 
@@ -832,9 +930,15 @@ with tabs[2]:
         pct_rows = []
         for v in vehicles:
             pool = [final_of(x) for x in vehicles if class_of(x) == class_of(v)]
+            p = percentile_rank(final_of(v), pool)
             pct_rows.append({"Vehicle": v, "Class": class_of(v), "Score": round(final_of(v), 2),
-                              "Percentile": f"{percentile_rank(final_of(v), pool)}th (n={len(pool)})"})
-        st.dataframe(pd.DataFrame(pct_rows), use_container_width=True, hide_index=True)
+                              "PercentileNum": p, "Percentile": f"{p}th (n={len(pool)})"})
+        pct_df = pd.DataFrame(pct_rows).sort_values("PercentileNum", ascending=True)
+        fig_pct = px.bar(pct_df, x="PercentileNum", y="Vehicle", orientation="h", color="Class",
+                          color_discrete_sequence=CLASS_COLORS)
+        fig_pct.update_layout(height=max(280, 26 * len(pct_df)), xaxis_title="Percentile within class", showlegend=False, margin=dict(l=0))
+        st.plotly_chart(fig_pct, use_container_width=True)
+        st.dataframe(pd.DataFrame(pct_rows).drop(columns=["PercentileNum"]), use_container_width=True, hide_index=True)
     with col2:
         st.subheader("Feature Penetration Lens")
         feature_names = sorted(set(r["feature"] for r in rows))
@@ -966,6 +1070,12 @@ with tabs[5]:
             gap_table.append({"Category": r["category"], "Type": r["type"], "Feature": r["feature"],
                                base: display_value(r, base), "Penetration %": pen, "Verdict": verdict, "Priority": round(priority, 4)})
         gap_table.sort(key=lambda x: -x["Priority"])
+        top10 = [g for g in gap_table if g["Priority"] > 0][:10]
+        if top10:
+            fig_gap = px.bar(pd.DataFrame(top10), x="Priority", y="Feature", orientation="h", color="Category",
+                              color_discrete_map={catCfg["name"]: catCfg["color"] for catCfg in category_config})
+            fig_gap.update_layout(height=max(280, 32 * len(top10)), yaxis=dict(autorange="reversed"), showlegend=False, margin=dict(l=0))
+            st.plotly_chart(fig_gap, use_container_width=True)
         st.dataframe(pd.DataFrame(gap_table), use_container_width=True, hide_index=True, height=460)
         st.caption("Priority Score = (competitor avg − base) × competitor penetration × category weight")
 
@@ -1004,26 +1114,41 @@ with tabs[6]:
 
 # ---------------- SCORE MATRIX ----------------
 with tabs[7]:
+    fr_distribution = [scores[v]["feature_rating"] for v in active_vehicles]
     matrix_rows = []
     for v in active_vehicles:
         row = {"Vehicle": v + (" (base)" if v == base else ""), "Class": class_of(v), "Price": money(price_of(v))}
         for c in cat_names:
             row[c] = round(scores[v]["normalized_category"].get(c, 0), 1)
         row["Feature Rating /10"] = round(scores[v]["feature_rating"], 1)
-        row["Tier"] = tier_label(scores[v]["feature_rating"])[0]
+        row["Tier"] = tier_label_relative(scores[v]["feature_rating"], fr_distribution)[0]
         matrix_rows.append(row)
     matrix_df = pd.DataFrame(matrix_rows)
+    st.caption("Tiers (Strong / Moderate / Below Avg / Weak) are ranked relative to the vehicles currently in scope, not a fixed absolute scale \u2014 as verified data gets deeper, the same vehicle's tier can shift even if its own score doesn't change.")
 
-    def _tier_bg(val):
-        if not isinstance(val, (int, float)):
-            return ""
-        _, color, bg = tier_label(val)
-        return f"background-color: {bg}; color: {color}; font-weight: 700;"
+    def _tier_bg_col(col):
+        dist = col.tolist()
+        styles = []
+        for val in col:
+            if not isinstance(val, (int, float)):
+                styles.append("")
+                continue
+            _, color, bg = tier_label_relative(val, dist)
+            styles.append(f"background-color: {bg}; color: {color}; font-weight: 700;")
+        return styles
 
     _score_cols = cat_names + ["Feature Rating /10"]
     _score_cols = [c for c in _score_cols if c in matrix_df.columns]
-    styled = matrix_df.style.map(_tier_bg, subset=_score_cols).format("{:.1f}", subset=_score_cols)
+    styled = matrix_df.style.apply(_tier_bg_col, subset=_score_cols).format("{:.1f}", subset=_score_cols)
     st.dataframe(styled, use_container_width=True, hide_index=True)
+
+    st.subheader("Score Matrix — Category Comparison")
+    smx_chart = pd.DataFrame([{"Vehicle": v, "Category": c, "Score": round(scores[v]["normalized_category"].get(c, 0), 1)}
+                               for v in active_vehicles for c in cat_names])
+    fig_smx = px.bar(smx_chart, x="Vehicle", y="Score", color="Category", barmode="group",
+                      color_discrete_map={catCfg["name"]: catCfg["color"] for catCfg in category_config})
+    fig_smx.update_layout(height=380, xaxis=dict(tickangle=-45, automargin=True), legend=dict(orientation="h", yanchor="bottom", y=1.02))
+    st.plotly_chart(fig_smx, use_container_width=True)
 
     st.subheader("Price Efficiency")
     eff = sorted(
@@ -1033,6 +1158,12 @@ with tabs[7]:
     )
     if eff:
         eff[0]["Verdict"] = "Best value"
+    if eff:
+        fig_eff = px.bar(pd.DataFrame(eff), x="Rating ÷ Price", y="Vehicle", orientation="h",
+                          color="Rating ÷ Price", color_continuous_scale=["#DCE3EC", ACCENT])
+        fig_eff.update_layout(height=max(280, 30 * len(eff)), yaxis=dict(autorange="reversed"),
+                               showlegend=False, coloraxis_showscale=False, margin=dict(l=0))
+        st.plotly_chart(fig_eff, use_container_width=True)
     st.dataframe(pd.DataFrame(eff), use_container_width=True, hide_index=True)
 
 # ---------------- BASELINE VS VFM ----------------
@@ -1112,6 +1243,14 @@ with tabs[9]:
                     "Notes": cur["notes"],
                 })
         if cost_rows:
+            chartable = [r for r in cost_rows if isinstance(r["Cost per Feature"], (int, float))]
+            if chartable:
+                cdf = pd.DataFrame(chartable)
+                cdf["Step"] = cdf["Model"] + ": " + cdf["From"] + " \u2192 " + cdf["To"]
+                fig_cost = px.bar(cdf, x="Cost per Feature", y="Step", orientation="h",
+                                   color="Cost per Feature", color_continuous_scale=[POSITIVE, "#F59E0B", NEGATIVE])
+                fig_cost.update_layout(height=max(240, 34 * len(cdf)), showlegend=False, coloraxis_showscale=False, margin=dict(l=0))
+                st.plotly_chart(fig_cost, use_container_width=True)
             st.dataframe(pd.DataFrame(cost_rows), use_container_width=True, hide_index=True)
             st.caption("Lower cost-per-feature = more feature value packed into that upgrade step. A trim with a big price jump but few new features stands out immediately here — useful for spotting badly-priced trims in your own lineup or a competitor's.")
         else:
@@ -1257,6 +1396,9 @@ with tabs[12]:
         row["Gap"] = "—" if v == base else f"{gaps[v]:+.2f}"
         rep_table.append(row)
     report_df = pd.DataFrame(rep_table)
+    fig_rep = px.bar(report_df, x="Vehicle", y="Final Score", color="Vehicle", color_discrete_sequence=CLASS_COLORS)
+    fig_rep.update_layout(height=340, showlegend=False, xaxis=dict(tickangle=-45, automargin=True))
+    st.plotly_chart(fig_rep, use_container_width=True)
     st.dataframe(report_df, use_container_width=True, hide_index=True)
 
     # Downloadable Excel report
