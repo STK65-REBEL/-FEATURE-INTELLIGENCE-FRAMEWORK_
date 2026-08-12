@@ -804,7 +804,13 @@ with st.sidebar:
 
     _scoped_vehicles = st.session_state.vehicles if st.session_state.market_scope == "Overall Market" else [
         v for v in st.session_state.vehicles if (st.session_state.class_.get(v) or "Unclassified") == st.session_state.market_scope]
-    st.metric("Vehicles in Scope", f"{len(_scoped_vehicles)} / {len(st.session_state.vehicles)}")
+    st.markdown(
+        f"""<div style="background:#FFFFFF; border-radius:8px; padding:10px 14px; margin-bottom:8px;">
+        <div style="font-size:0.72rem; text-transform:uppercase; letter-spacing:0.05em; font-weight:700; color:#667085;">Vehicles in Scope</div>
+        <div style="font-size:1.55rem; font-weight:800; color:#0B2559;">{len(_scoped_vehicles)} / {len(st.session_state.vehicles)}</div>
+        </div>""",
+        unsafe_allow_html=True,
+    )
 
     if st.session_state.base_vehicle not in _scoped_vehicles and _scoped_vehicles:
         st.session_state.base_vehicle = _scoped_vehicles[0]
@@ -949,9 +955,30 @@ tabs = st.tabs(TAB_NAMES)
 
 # ---------------- OVERVIEW ----------------
 with tabs[0]:
+    scorable_count = sum(1 for r in rows if r["type"] != "Categorical" and r["category"] in cat_by_name)
+    st.subheader("Market Snapshot")
+    d1, d2, d3, d4 = st.columns(4)
+    d1.metric("Vehicles Tracked", len(active_vehicles))
+    d2.metric("Features Tracked", scorable_count)
+    d3.metric("OEMs in Scope", len(set(v.split()[0] for v in active_vehicles)))
+    avg_score = sum(final_of(v) for v in active_vehicles) / len(active_vehicles) if active_vehicles else 0
+    d4.metric("Average Final Score", f"{avg_score:.2f}")
+
+    all_ranked_df = pd.DataFrame({"Vehicle": ranked, "Final Score": [round(final_of(v), 2) for v in ranked],
+                                   "Class": [class_of(v) for v in ranked]})
+    fig_market = px.bar(all_ranked_df, x="Vehicle", y="Final Score", color="Class", color_discrete_sequence=CLASS_COLORS)
+    fig_market.update_layout(height=340, xaxis=dict(tickangle=-45, automargin=True), legend=dict(orientation="h", yanchor="bottom", y=1.02))
+    st.plotly_chart(fig_market, use_container_width=True)
+    st.caption("Ranked by Final Score across every vehicle currently in scope — this is the headline market view. Everything below explains a specific piece of it.")
+
+    st.markdown("---")
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Best Vehicle", best_vehicle, f"{final_of(best_vehicle):.2f}" if best_vehicle else "—")
-    c2.metric("Worst Vehicle", worst_vehicle, f"{final_of(worst_vehicle):.2f}" if worst_vehicle else "—")
+    if best_vehicle:
+        best_tier = tier_label_relative(scores[best_vehicle]["feature_rating"], [scores[v]["feature_rating"] for v in active_vehicles])[0]
+        c1.metric("Market Leader", best_vehicle, f"{final_of(best_vehicle):.2f}  \u00b7  {best_tier}")
+    else:
+        c1.metric("Market Leader", "—")
+    c2.metric("Needs the Most Work", worst_vehicle, f"{final_of(worst_vehicle):.2f}" if worst_vehicle else "—")
     if len(non_base) >= 2:
         hp = max(non_base, key=lambda v: gaps[v])
         hn = min(non_base, key=lambda v: gaps[v])
@@ -967,7 +994,15 @@ with tabs[0]:
     else:
         c3.metric("Highest Positive Gap", "—", "No competitors in this scope")
         c4.metric("Highest Negative Gap", "—", "No competitors in this scope")
+    with st.expander("How is Final Score calculated?"):
+        st.markdown(
+            "**Final Score** = weighted sum of 4 category scores (Safety, Comfort, Technology, Utility — weights editable in the sidebar). "
+            "Each category score is the sum of every feature's contribution: `(how much of the feature the vehicle has, 0 to 1) \u00d7 category multiplier`. "
+            "A vehicle only scores on features it's actually been researched for — an unresearched feature contributes 0, the same as a real absence. "
+            f"That's why even the top vehicle here typically doesn't approach a theoretical maximum: it reflects **{scores[best_vehicle]['feature_count'] if best_vehicle else 0} of {scorable_count} scorable features researched**, not a ceiling in the math."
+        )
 
+    st.markdown("---")
     col1, col2 = st.columns(2)
     with col1:
         if best_competitor is None:
@@ -984,6 +1019,7 @@ with tabs[0]:
                          color="Gap", color_continuous_scale=["#DC2626", "#94A3B8", ACCENT])
             fig.update_layout(height=300, showlegend=False, coloraxis_showscale=False)
             st.plotly_chart(fig, use_container_width=True)
+            st.caption(f"Positive bars = categories where {best_competitor} leads {base}. Formula: {best_competitor}'s category score minus {base}'s, for each category.")
     with col2:
         st.subheader(f"Top Priority Features to add to {base}")
         priority_rows = []
@@ -999,7 +1035,8 @@ with tabs[0]:
         if top5:
             fig_top5 = px.bar(pd.DataFrame(top5), x="Priority", y="Feature", orientation="h", color="Category",
                                color_discrete_map={catCfg["name"]: catCfg["color"] for catCfg in category_config})
-            fig_top5.update_layout(height=260, yaxis=dict(autorange="reversed"), showlegend=False, margin=dict(l=0))
+            fig_top5.update_layout(height=280, yaxis=dict(autorange="reversed", automargin=True), bargap=0.4,
+                                    legend=dict(orientation="h", yanchor="bottom", y=1.02, title=None), margin=dict(l=10))
             st.plotly_chart(fig_top5, use_container_width=True)
         st.dataframe(pd.DataFrame(top5), use_container_width=True, hide_index=True)
         st.caption("Priority = (competitor avg − base) × competitor penetration × category weight")
@@ -1095,7 +1132,8 @@ with tabs[2]:
     pct_df = pd.DataFrame(pct_rows).sort_values("PercentileNum", ascending=True)
     fig_pct = px.bar(pct_df, x="PercentileNum", y="Vehicle", orientation="h", color="Class",
                       color_discrete_sequence=CLASS_COLORS)
-    fig_pct.update_layout(height=max(280, 26 * len(pct_df)), xaxis_title="Percentile within class", showlegend=False, margin=dict(l=0))
+    fig_pct.update_layout(height=max(280, 26 * len(pct_df)), xaxis_title="Percentile within class",
+                           legend=dict(orientation="h", yanchor="bottom", y=1.02, title=None), margin=dict(l=10), bargap=0.3)
     st.plotly_chart(fig_pct, use_container_width=True)
     st.dataframe(pd.DataFrame(pct_rows).drop(columns=["PercentileNum"]), use_container_width=True, hide_index=True)
 
@@ -1224,7 +1262,8 @@ with tabs[5]:
         if top10:
             fig_gap = px.bar(pd.DataFrame(top10), x="Priority", y="Feature", orientation="h", color="Category",
                               color_discrete_map={catCfg["name"]: catCfg["color"] for catCfg in category_config})
-            fig_gap.update_layout(height=max(280, 32 * len(top10)), yaxis=dict(autorange="reversed"), showlegend=False, margin=dict(l=0))
+            fig_gap.update_layout(height=max(300, 30 * len(top10)), yaxis=dict(autorange="reversed", automargin=True), bargap=0.35,
+                                   legend=dict(orientation="h", yanchor="bottom", y=1.02, title=None), margin=dict(l=10))
             st.plotly_chart(fig_gap, use_container_width=True)
         st.dataframe(pd.DataFrame(gap_table), use_container_width=True, hide_index=True, height=460)
         st.caption("Priority Score = (competitor avg − base) × competitor penetration × category weight")
