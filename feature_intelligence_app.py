@@ -115,15 +115,31 @@ def contribution_for(row, vehicle, category_by_name, numeric_stats, numeric_mode
     return 0.0
 
 
-def compute_scores(vehicles, rows, category_config, relevance, numeric_mode):
-    category_by_name = {c["name"]: c for c in category_config}
-    cat_names = [c["name"] for c in category_config]
+def compute_numeric_stats(vehicles, rows):
+    """Single source of truth for Numeric-feature min/max across the current vehicle set.
+    Every place that scores a Numeric feature outside the main compute_scores() loop
+    MUST use this — passing {} silently makes every Numeric feature contribute 0
+    (this was bug #1 in the Aug 2026 QA pass: 9 call sites had this exact mistake).
 
+    A genuinely unresearched cell (None/""/"nan") is EXCLUDED from the min/max range,
+    not silently counted as a real 0 — otherwise one unresearched vehicle drags the
+    whole scale down and distorts every other vehicle's normalized score too. The
+    unresearched vehicle itself still scores 0 for that feature (we can't credit what
+    we don't know), but it no longer corrupts the scale for everyone else."""
     numeric_stats = {}
     for r in rows:
         if r["type"] == "Numeric":
-            vals = [float(r["values"].get(v) or 0) for v in vehicles]
-            numeric_stats[r["feature"]] = {"min": min(vals), "max": max(vals)}
+            vals = [float(r["values"].get(v)) for v in vehicles if r["values"].get(v) not in (None, "", "nan")]
+            numeric_stats[r["feature"]] = {"min": min(vals), "max": max(vals)} if vals else {"min": 0, "max": 0}
+    return numeric_stats
+
+
+def compute_scores(vehicles, rows, category_config, relevance, numeric_mode, numeric_stats=None):
+    category_by_name = {c["name"]: c for c in category_config}
+    cat_names = [c["name"] for c in category_config]
+
+    if numeric_stats is None:
+        numeric_stats = compute_numeric_stats(vehicles, rows)
 
     scorable = [r for r in rows if r["type"] != "Categorical" and r["category"] in category_by_name]
     max_category_raw = {
@@ -326,8 +342,11 @@ def parse_excel_bytes(file_bytes, known_category_names=None):
                         idx = next((i for i, l in enumerate(levels) if l.lower() == s), 0)
                         values[v] = idx
             elif ftype == "Numeric":
-                try: values[v] = float(val) if pd.notna(val) else 0
-                except Exception: values[v] = 0
+                if pd.isna(val) or str(val).strip() == "":
+                    values[v] = ""  # genuinely unresearched — NOT the same as a real 0
+                else:
+                    try: values[v] = float(val)
+                    except Exception: values[v] = ""
             else:
                 values[v] = str(val).strip() if pd.notna(val) else ""
 
@@ -374,8 +393,8 @@ def dataframe_to_rows(df, vehicles):
                 try: values[v] = int(float(raw)) if str(raw).strip() != "" else 0
                 except Exception: values[v] = 0
             elif ftype == "Numeric":
-                try: values[v] = float(raw) if str(raw).strip() != "" else 0
-                except Exception: values[v] = 0
+                try: values[v] = float(raw) if str(raw).strip() != "" else ""
+                except Exception: values[v] = ""
             else:
                 values[v] = str(raw) if raw is not None else ""
         rows.append({"category": str(r.get("Category", "")).strip(), "subgroup": str(r.get("Subgroup", "")).strip() or str(r.get("Category", "")).strip(),
@@ -664,8 +683,9 @@ category_config = st.session_state.category_config
 cat_names = [c["name"] for c in category_config]
 cat_by_name = {c["name"]: c for c in category_config}
 base = st.session_state.base_vehicle if st.session_state.base_vehicle in vehicles else (vehicles[0] if vehicles else None)
+numeric_stats = compute_numeric_stats(vehicles, rows)
 scores = compute_scores(vehicles, rows, category_config, st.session_state.relevance,
-                         "fixed" if st.session_state.numeric_mode == "Fixed Ceiling" else "relative")
+                         "fixed" if st.session_state.numeric_mode == "Fixed Ceiling" else "relative", numeric_stats)
 score_key = "customer_final" if st.session_state.score_mode == "Customer-Weighted" else "engineering_final"
 cat_key = "customer_category_scores" if st.session_state.score_mode == "Customer-Weighted" else "category_scores"
 
@@ -690,6 +710,16 @@ best_vehicle = ranked[0] if ranked else None
 worst_vehicle = ranked[-1] if ranked else None
 non_base = [v for v in active_vehicles if v != base]
 gaps = {v: final_of(v) - final_of(base) for v in active_vehicles} if base else {}
+# Best-in-scope can legitimately BE the base vehicle (it means base is winning) — but a
+# "Recommendation Engine: X vs X" chart is a real bug, not a legitimate self-comparison.
+# The Recommendation Engine specifically needs the best NON-base competitor.
+best_competitor = max(non_base, key=final_of) if non_base else None
+
+
+def fmt_signed(x, decimals=2):
+    """+1.28 / -1.28 / 0.00 — never the '+-1.28' bug from string-concatenating a
+    hardcoded '+' onto a value that might already be negative."""
+    return f"{x:+.{decimals}f}"
 
 
 # ============================================================================
@@ -707,17 +737,33 @@ with tabs[0]:
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Best Vehicle", best_vehicle, f"{final_of(best_vehicle):.2f}" if best_vehicle else "—")
     c2.metric("Worst Vehicle", worst_vehicle, f"{final_of(worst_vehicle):.2f}" if worst_vehicle else "—")
-    if non_base:
+    if len(non_base) >= 2:
         hp = max(non_base, key=lambda v: gaps[v])
         hn = min(non_base, key=lambda v: gaps[v])
-        c3.metric("Highest Positive Gap", hp, f"+{gaps[hp]:.2f}")
-        c4.metric("Highest Negative Gap", hn, f"{gaps[hn]:.2f}")
+        hp_label = "Highest Positive Gap" if gaps[hp] > 0 else "Closest Competitor (still behind base)"
+        hn_label = "Highest Negative Gap" if gaps[hn] < 0 else "Weakest Competitor (still ahead of base)"
+        c3.metric(hp_label, hp, fmt_signed(gaps[hp]))
+        c4.metric(hn_label, hn, fmt_signed(gaps[hn]))
+    elif len(non_base) == 1:
+        v = non_base[0]
+        label = "Only Competitor in Scope" if gaps[v] != 0 else "Only Competitor (tied with base)"
+        c3.metric(label, v, fmt_signed(gaps[v]))
+        c4.metric(" ", "", "")  # intentionally blank — one competitor can't produce two distinct extremes
+    else:
+        c3.metric("Highest Positive Gap", "—", "No competitors in this scope")
+        c4.metric("Highest Negative Gap", "—", "No competitors in this scope")
 
     col1, col2 = st.columns(2)
     with col1:
-        st.subheader(f"Recommendation Engine: {best_vehicle} vs {base}")
-        if best_vehicle and base:
-            rec = sorted([{"Category": c, "Gap": cat_score_of(best_vehicle, c) - cat_score_of(base, c)} for c in cat_names],
+        if best_competitor is None:
+            st.subheader("Recommendation Engine")
+            st.info(f"No competitors in the current scope to compare {base} against — widen Market Scope in the sidebar.")
+        elif best_competitor == base:
+            st.subheader("Recommendation Engine")
+            st.success(f"{base} is already the top scorer in this scope — no competitor to close a gap against.")
+        else:
+            st.subheader(f"Recommendation Engine: {best_competitor} vs {base}")
+            rec = sorted([{"Category": c, "Gap": cat_score_of(best_competitor, c) - cat_score_of(base, c)} for c in cat_names],
                          key=lambda x: -x["Gap"])
             fig = px.bar(pd.DataFrame(rec), x="Gap", y="Category", orientation="h",
                          color="Gap", color_continuous_scale=["#DC2626", "#94A3B8", ACCENT])
@@ -727,8 +773,8 @@ with tabs[0]:
         st.subheader(f"Top Priority Features to add to {base}")
         priority_rows = []
         for r in rows:
-            base_c = contribution_for(r, base, cat_by_name, {}, "relative") if base else 0
-            others = [contribution_for(r, v, cat_by_name, {}, "relative") for v in non_base]
+            base_c = contribution_for(r, base, cat_by_name, numeric_stats, "relative") if base else 0
+            others = [contribution_for(r, v, cat_by_name, numeric_stats, "relative") for v in non_base]
             avg_others = (sum(others) / len(others)) if others else 0
             pen = (sum(1 for o in others if o > 0) / len(others)) if others else 0
             weight = cat_by_name.get(r["category"], {"weight": 0})["weight"]
@@ -758,8 +804,8 @@ with tabs[1]:
     diff_rows = []
     for r in rows:
         va, vb = display_value(r, a), display_value(r, b)
-        ca = contribution_for(r, a, cat_by_name, {}, "relative")
-        cb = contribution_for(r, b, cat_by_name, {}, "relative")
+        ca = contribution_for(r, a, cat_by_name, numeric_stats, "relative")
+        cb = contribution_for(r, b, cat_by_name, numeric_stats, "relative")
         diff_rows.append({"Category": r["category"], "Feature": r["feature"], a: va, b: vb, "Differs": abs(ca - cb) > 0.005})
     diff_df = pd.DataFrame(diff_rows)
     st.dataframe(diff_df.style.apply(lambda row: ["background-color: #FFFBEB" if row["Differs"] else "" for _ in row], axis=1),
@@ -772,10 +818,13 @@ with tabs[2]:
     pos_data = [{"Vehicle": v, "Price": price_of(v), "Score": final_of(v), "Class": class_of(v), "Features": scores[v]["feature_count"]}
                 for v in vehicles if seg_filter == "All" or class_of(v) == seg_filter]
     fig = px.scatter(pd.DataFrame(pos_data), x="Price", y="Score", color="Class", size="Features",
-                      text="Vehicle", color_discrete_sequence=CLASS_COLORS)
-    fig.update_traces(textposition="top center")
-    fig.update_layout(height=420)
+                      hover_name="Vehicle", hover_data={"Class": True, "Price": ":.2f", "Score": ":.2f", "Features": True},
+                      color_discrete_sequence=CLASS_COLORS)
+    fig.update_traces(marker=dict(line=dict(width=1, color="white")))
+    fig.update_layout(height=420, xaxis=dict(automargin=True))
     st.plotly_chart(fig, use_container_width=True)
+    if len(pos_data) > 10:
+        st.caption("Hover a point for the vehicle name \u2014 with this many vehicles, permanent on-chart labels would overlap. Filter by class above for a labeled close-up.")
 
     col1, col2 = st.columns(2)
     with col1:
@@ -793,22 +842,27 @@ with tabs[2]:
         frow = next((r for r in rows if r["feature"] == chosen_feature), None)
         if frow:
             pool = [v for v in vehicles if seg_filter == "All" or class_of(v) == seg_filter]
-            has_it = [v for v in pool if contribution_for(frow, v, cat_by_name, {}, "relative") > 0]
+            has_it = [v for v in pool if contribution_for(frow, v, cat_by_name, numeric_stats, "relative") > 0]
             st.metric("Penetration", f"{round(len(has_it)/len(pool)*100) if pool else 0}%")
 
             if frow["type"] != "Categorical" and pool:
                 mult = cat_by_name.get(frow["category"], {"multiplier": 1})["multiplier"]
                 scatter_rows = [{
                     "Vehicle": v, "Price": price_of(v), "Class": class_of(v),
-                    "Feature Level": round(contribution_for(frow, v, cat_by_name, {}, "relative") / mult, 2) if mult else 0,
+                    "Feature Level": round(contribution_for(frow, v, cat_by_name, numeric_stats, "relative") / mult, 2) if mult else 0,
                     "Value": display_value(frow, v),
                 } for v in pool]
                 fig_pen = px.scatter(pd.DataFrame(scatter_rows), x="Price", y="Feature Level", color="Class",
-                                      text="Vehicle", hover_data=["Value"], color_discrete_sequence=CLASS_COLORS)
-                fig_pen.update_traces(textposition="top center", marker=dict(size=11))
-                fig_pen.update_layout(height=340, yaxis=dict(range=[-0.1, 1.1]),
-                                       yaxis_title="Feature Level (0 = absent, 1 = best available)")
+                                      hover_name="Vehicle", hover_data={"Class": True, "Value": True, "Price": ":.2f", "Feature Level": ":.2f"},
+                                      color_discrete_sequence=CLASS_COLORS)
+                fig_pen.update_traces(marker=dict(size=12, line=dict(width=1, color="white")))
+                fig_pen.update_layout(
+                    height=380, yaxis=dict(range=[-0.1, 1.1]),
+                    yaxis_title="Feature Level (0 = absent, 1 = best available)",
+                    xaxis=dict(automargin=True),
+                )
                 st.plotly_chart(fig_pen, use_container_width=True)
+                st.caption("Hover a point for the vehicle name and exact value — labels are hidden by default so they stay readable as more vehicles are added.")
             st.dataframe(pd.DataFrame([{"Vehicle": v, "Value": display_value(frow, v)} for v in pool]),
                          use_container_width=True, hide_index=True)
 
@@ -817,16 +871,16 @@ with tabs[3]:
     col1, col2 = st.columns(2)
     with col1:
         st.subheader("Final Vehicle Score")
-        sdf = pd.DataFrame({"Vehicle": ranked, "Score": [final_of(v) for v in ranked],
+        sdf = pd.DataFrame({"Vehicle": ranked, "Score": [round(final_of(v), 2) for v in ranked],
                              "IsBase": [v == base for v in ranked]})
         fig = px.bar(sdf, x="Vehicle", y="Score", color="IsBase", color_discrete_map={True: "#94A3B8", False: ACCENT})
-        fig.update_layout(showlegend=False, height=350)
+        fig.update_layout(showlegend=False, height=380, xaxis=dict(tickangle=-45, automargin=True))
         st.plotly_chart(fig, use_container_width=True)
     with col2:
         st.subheader(f"Gap vs {base}")
-        gdf = pd.DataFrame({"Vehicle": non_base, "Gap": [gaps[v] for v in non_base]})
+        gdf = pd.DataFrame({"Vehicle": non_base, "Gap": [round(gaps[v], 2) for v in non_base]})
         fig = px.bar(gdf, x="Vehicle", y="Gap", color=gdf["Gap"] >= 0, color_discrete_map={True: POSITIVE, False: NEGATIVE})
-        fig.update_layout(showlegend=False, height=350)
+        fig.update_layout(showlegend=False, height=380, xaxis=dict(tickangle=-45, automargin=True))
         fig.add_hline(y=0, line_color="#94A3B8")
         st.plotly_chart(fig, use_container_width=True)
 
@@ -862,7 +916,7 @@ with tabs[4]:
     sub_records = []
     for sg in subgroups:
         for v in active_vehicles:
-            val = sum(contribution_for(r, v, cat_by_name, {}, "relative") for r in rows if r["category"] == sub_cat and r["subgroup"] == sg)
+            val = sum(contribution_for(r, v, cat_by_name, numeric_stats, "relative") for r in rows if r["category"] == sub_cat and r["subgroup"] == sg)
             sub_records.append({"Subgroup": sg, "Vehicle": v, "Score": round(val, 2)})
     if sub_records:
         sub_df = pd.DataFrame(sub_records)
@@ -900,8 +954,8 @@ with tabs[5]:
     else:
         gap_table = []
         for r in filtered_rows:
-            base_c = contribution_for(r, base, cat_by_name, {}, "relative")
-            others = [contribution_for(r, v, cat_by_name, {}, "relative") for v in competitors]
+            base_c = contribution_for(r, base, cat_by_name, numeric_stats, "relative")
+            others = [contribution_for(r, v, cat_by_name, numeric_stats, "relative") for v in competitors]
             avg_others = (sum(others) / len(others)) if others else 0
             verdict = "Parity"
             if base_c > avg_others + 0.001: verdict = "Base ahead"
@@ -967,7 +1021,8 @@ with tabs[7]:
         return f"background-color: {bg}; color: {color}; font-weight: 700;"
 
     _score_cols = cat_names + ["Feature Rating /10"]
-    styled = matrix_df.style.map(_tier_bg, subset=[c for c in _score_cols if c in matrix_df.columns])
+    _score_cols = [c for c in _score_cols if c in matrix_df.columns]
+    styled = matrix_df.style.map(_tier_bg, subset=_score_cols).format("{:.1f}", subset=_score_cols)
     st.dataframe(styled, use_container_width=True, hide_index=True)
 
     st.subheader("Price Efficiency")
